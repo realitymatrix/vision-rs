@@ -103,13 +103,17 @@ impl<'d> Block<'d> {
 
         let slots: Vec<(String, usize, usize)> = model.param_info_named().collect();
         if !slots.is_empty() {
-            let mut remaining = weight_keys(weights_dir);
+            let all = weight_keys(weights_dir);
+            let mut remaining = all.clone();
             for (slot, node, idx) in &slots {
                 let key = torch_key(slot);
+                // A slot may repeat: one PyTorch parameter applied at several places
+                // (DINOv2's final `norm` on each returned layer).
                 assert!(
-                    remaining.remove(&key),
+                    all.contains(&key),
                     "{label}: graph slot {slot} ({key}) has no PyTorch weight"
                 );
+                remaining.remove(&key);
                 model.load_param_f32(
                     *node,
                     *idx,
