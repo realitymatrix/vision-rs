@@ -20,4 +20,5 @@
 
 pub mod decoder;
 pub mod dinov2;
+pub mod dpt;
 pub mod edgenext;

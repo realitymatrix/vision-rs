@@ -7,6 +7,7 @@ pub mod channel_slice;
 pub mod channel_softmax;
 pub mod context_upsample;
 pub mod conv_transpose2d_k4s2p1;
+pub mod conv_transpose_patch;
 pub mod correlation;
 pub mod gated_blend;
 pub mod gelu_erf;

@@ -210,10 +210,14 @@ pub fn source_mapping(input: usize, output: usize, align_corners: bool) -> (f32,
 ///
 /// Inputs, in order: `x` `[B, C, IH, IW]`, then `dest`, which is read only for its
 /// spatial size `[.., .., OH, OW]`. This is FoundationStereo's `interp(x, dest)`
-/// (`core/update.py`). Output `[B, C, OH, OW]`.
+/// (`core/update.py`). Output `[B, C, OH, OW]`. Built with [`Self::to_size`], the op
+/// takes `x` alone and resizes to a fixed size (`F.interpolate(x, size=…)`, or a
+/// `scale_factor`, whose `align_corners=True` mapping depends only on the sizes).
 pub struct InterpolateBilinearOp<D: FloatBytes + Send + Sync + 'static> {
     /// `align_corners` as passed to `F.interpolate`.
     pub align_corners: bool,
+    /// Fixed output size, or `None` to take it from `dest`.
+    pub size: Option<(usize, usize)>,
     /// Kernel launch block size along the output column axis.
     pub block_p: i32,
     _phantom: PhantomData<D>,
@@ -224,6 +228,17 @@ impl<D: FloatBytes + Send + Sync + 'static> InterpolateBilinearOp<D> {
     pub fn new(align_corners: bool, block_p: i32) -> Self {
         Self {
             align_corners,
+            size: None,
+            block_p,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Creates the op resizing to a fixed `(OH, OW)`, with `x` its only input.
+    pub fn to_size(align_corners: bool, size: (usize, usize), block_p: i32) -> Self {
+        Self {
+            align_corners,
+            size: Some(size),
             block_p,
             _phantom: PhantomData,
         }
@@ -236,8 +251,11 @@ impl<D: FloatBytes + Send + Sync + 'static> CustomOp for InterpolateBilinearOp<D
     }
 
     fn infer_output_shape(&self, input_shapes: &[&Shape]) -> Shape {
-        let (x, dest) = (input_shapes[0], input_shapes[1]);
-        vec![x[0], x[1], dest[2], dest[3]]
+        let x = input_shapes[0];
+        match self.size {
+            Some((oh, ow)) => vec![x[0], x[1], Some(oh), Some(ow)],
+            None => vec![x[0], x[1], input_shapes[1][2], input_shapes[1][3]],
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -250,16 +268,17 @@ impl<D: FloatBytes + Send + Sync + 'static> CustomOp for InterpolateBilinearOp<D
             "interpolate_bilinear_forward".to_string(),
             kernel.source,
             "entry_point".to_string(),
-            Arc::new(InterpolateBilinearRuntimeOp::<D>::new(
-                self.align_corners,
-                self.block_p,
-            )),
+            Arc::new(InterpolateBilinearRuntimeOp::<D> {
+                n_inputs: if self.size.is_some() { 1 } else { 2 },
+                ..InterpolateBilinearRuntimeOp::new(self.align_corners, self.block_p)
+            }),
         ))
     }
 }
 
 /// Runtime dispatch for [`InterpolateBilinearOp`].
 pub struct InterpolateBilinearRuntimeOp<D: FloatBytes + Send + Sync + 'static> {
+    n_inputs: usize,
     align_corners: bool,
     block_p: i32,
     _phantom: PhantomData<D>,
@@ -269,6 +288,7 @@ impl<D: FloatBytes + Send + Sync + 'static> InterpolateBilinearRuntimeOp<D> {
     /// Creates the runtime op.
     pub fn new(align_corners: bool, block_p: i32) -> Self {
         Self {
+            n_inputs: 2,
             align_corners,
             block_p,
             _phantom: PhantomData,
@@ -278,7 +298,7 @@ impl<D: FloatBytes + Send + Sync + 'static> InterpolateBilinearRuntimeOp<D> {
 
 impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for InterpolateBilinearRuntimeOp<D> {
     fn n_activation_inputs(&self) -> usize {
-        2
+        self.n_inputs
     }
 
     fn param_shapes(&self, _input_shapes: &[&[usize]], _output_shape: &[usize]) -> Vec<Vec<usize>> {
@@ -298,7 +318,7 @@ impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for InterpolateBilinearRun
         let (ih, iw, oh, ow) = (x[2], x[3], output_shape[2], output_shape[3]);
         let (sy, oy) = source_mapping(ih, oh, self.align_corners);
         let (sx, ox) = source_mapping(iw, ow, self.align_corners);
-        // `dest` (inputs[1]) is only consulted for its shape.
+        // `dest` (inputs[1], if any) is only consulted for its shape.
         visitor.visit_ptr(inputs[0].0);
         visitor.visit_ptr(output);
         visitor.visit_i32(output_shape[1] as i32);
