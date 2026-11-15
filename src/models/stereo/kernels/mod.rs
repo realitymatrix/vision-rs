@@ -2,11 +2,13 @@
 
 pub mod avg_pool2d_padded;
 pub mod bilinear_sampler_1d;
+pub mod cat2;
 pub mod channel_gate;
 pub mod channel_layer_norm;
 pub mod channel_mean_max;
 pub mod channel_slice;
 pub mod channel_softmax;
+pub mod concat_volume;
 pub mod context_upsample;
 pub mod conv_transpose2d_k4s2p1;
 pub mod conv_transpose_patch;
@@ -15,6 +17,7 @@ pub mod gated_blend;
 pub mod gelu_erf;
 pub mod geo_lookup;
 pub mod global_pool;
+pub mod gwc_volume;
 pub mod instance_norm3d;
 pub mod interpolate_bicubic;
 pub mod interpolate_bilinear;
