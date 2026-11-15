@@ -40,10 +40,17 @@ use teeny_core::{
 
 use crate::models::stereo::kernels::{
     batch_norm_inference::BatchNormInferenceOp,
+    cat2::Cat2Op,
+    channel_layer_norm::ChannelLayerNormOp,
+    conv_transpose3d_k4s2p1::ConvTranspose3dK4s2p1Op,
     conv3d_direct::{Conv3dDirectOp, Conv3dSpec},
+    disp_pos_embed::DispPosEmbedOp,
+    head_attn_apply::HeadAttnApplyOp,
+    head_attn_logits::HeadAttnLogitsOp,
+    trilinear_upsample::TrilinearUpsampleOp,
     volume_gate::VolumeGateOp,
 };
-use crate::models::stereo::update::ops::{add, conv, conv_no_bias, leaky, relu};
+use crate::models::stereo::update::ops::{add, conv, conv_no_bias, gelu, leaky, relu};
 
 /// FoundationStereo's `volume_dim`, the filtered volume's channels.
 pub const VOLUME_DIM: usize = 28;
@@ -156,4 +163,211 @@ pub fn feature_att<D: Float + FloatBytes + Send + Sync + 'static>(
         conv::<D>("1", feat_chan / 2, cv_chan, 1)(&h)
     };
     cv.record_custom(CustomData::new(VolumeGateOp::<D>::new(256)), &[&g], None)
+}
+
+/// `BasicConv(c_in, c_out, is_3d=True, kernel_size=k, stride, padding=k // 2)`.
+fn basic_conv3d_s<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c_in: usize,
+    c_out: usize,
+    k: usize,
+    stride: usize,
+) -> SymTensor {
+    let spec = Conv3dSpec {
+        stride: [stride; 3],
+        ..Conv3dSpec::cube(c_in, c_out, k, false)
+    };
+    let y = conv3d_spec::<D>("conv", x, spec);
+    leaky::<D>(&bn3d::<D>("bn", &y, c_out))
+}
+
+/// `BasicConv(c_in, c_out, deconv=True, is_3d=True, kernel_size=4, stride=2,
+/// padding=1)`: bias-free transposed conv, BatchNorm3d, LeakyReLU.
+fn basic_deconv3d<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c_in: usize,
+    c_out: usize,
+) -> SymTensor {
+    let y = {
+        let _g = name_scope("conv");
+        x.record_custom(
+            CustomData::new(ConvTranspose3dK4s2p1Op::<D>::new(c_in, c_out, 32)),
+            &[],
+            None,
+        )
+    };
+    leaky::<D>(&bn3d::<D>("bn", &y, c_out))
+}
+
+/// `Conv3dNormActReduced(c_in, c_out, kernel_size=3, kernel_disp=17)`: a `(1, 3, 3)`
+/// conv then a `(17, 1, 1)` conv, each with bias, BatchNorm3d and ReLU.
+pub fn conv3d_reduced<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c_in: usize,
+    c_out: usize,
+) -> SymTensor {
+    let spatial = Conv3dSpec {
+        kernel: [1, 3, 3],
+        padding: [0, 1, 1],
+        ..Conv3dSpec::cube(c_in, c_out, 1, true)
+    };
+    let disp = Conv3dSpec {
+        kernel: [17, 1, 1],
+        padding: [8, 0, 0],
+        ..Conv3dSpec::cube(c_out, c_out, 1, true)
+    };
+    let x = {
+        let _g = name_scope("conv1");
+        relu::<D>(bn3d::<D>("1", &conv3d_spec::<D>("0", x, spatial), c_out))
+    };
+    let _g = name_scope("conv2");
+    relu::<D>(bn3d::<D>("1", &conv3d_spec::<D>("0", &x, disp), c_out))
+}
+
+/// One `FlashAttentionTransformerEncoderLayer` on a volume (post-norm, GELU, as
+/// FoundationStereo runs it): the attention is per voxel across heads (see
+/// [`HeadAttnLogitsOp`]), every linear a 1x1x1 conv, every LayerNorm over channels.
+pub fn transformer_layer<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c: usize,
+    heads: usize,
+    ffn: usize,
+) -> SymTensor {
+    let ln = |name: &str, t: &SymTensor| {
+        let _g = name_scope(name);
+        t.record_custom(
+            CustomData::new(ChannelLayerNormOp::<D>::new(c, 1e-5, 256)),
+            &[],
+            None,
+        )
+    };
+    let a = {
+        let _g = name_scope("self_attn");
+        let q = conv3d::<D>("q_proj", x, c, c, 1, true);
+        let k = conv3d::<D>("k_proj", x, c, c, 1, true);
+        let v = conv3d::<D>("v_proj", x, c, c, 1, true);
+        let hd = c / heads;
+        let l = q.record_custom(
+            CustomData::new(HeadAttnLogitsOp::<D>::new(heads, hd, 256)),
+            &[&k],
+            None,
+        );
+        let o = l.record_custom(
+            CustomData::new(HeadAttnApplyOp::<D>::new(heads, hd, 256)),
+            &[&v],
+            None,
+        );
+        conv3d::<D>("out_proj", &o, c, c, 1, true)
+    };
+    let x = ln("norm1", &add(x, &a));
+    let h = conv3d::<D>("linear1", &x, c, ffn, 1, true);
+    let h = conv3d::<D>("linear2", &gelu::<D>(&h), ffn, c, 1, true);
+    ln("norm2", &add(&x, &h))
+}
+
+/// `CostVolumeDisparityAttention(d_model=c, nhead=4, dim_feedforward=c,
+/// num_transformer=4)`: the disparity embedding, then the layers (`sa.{i}`).
+pub fn disparity_attention<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c: usize,
+) -> SymTensor {
+    let mut x = x.record_custom(CustomData::new(DispPosEmbedOp::<D>::new(256)), &[], None);
+    for i in 0..4 {
+        let _g = name_scope(format!("sa.{i}"));
+        x = transformer_layer::<D>(&x, c, 4, c);
+    }
+    x
+}
+
+/// `hourglass(in_channels=c, feat_dims)` (`cost_agg`) on volume `x` with the left
+/// features at 1/4, 1/8, 1/16 and 1/32 (`feat_dims` channels).
+pub fn hourglass<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    features: [&SymTensor; 4],
+    c: usize,
+    feat_dims: [usize; 4],
+) -> SymTensor {
+    let down = |name: &str, x: &SymTensor, ci: usize, co: usize| {
+        let _g = name_scope(name);
+        let y = {
+            let _b = name_scope("0");
+            basic_conv3d_s::<D>(x, ci, co, 3, 2)
+        };
+        let _r = name_scope("1");
+        conv3d_reduced::<D>(&y, co, co)
+    };
+    let fatt = |name: &str, cv: &SymTensor, f: &SymTensor, cc: usize, fc: usize| {
+        let _g = name_scope(name);
+        feature_att::<D>(cv, f, cc, fc)
+    };
+    let agg = |name: &str, x: &SymTensor, ci: usize, co: usize| {
+        let _g = name_scope(name);
+        let y = {
+            let _b = name_scope("0");
+            basic_conv3d_s::<D>(x, ci, co, 1, 1)
+        };
+        let y = {
+            let _r = name_scope("1");
+            conv3d_reduced::<D>(&y, co, co)
+        };
+        let _r = name_scope("2");
+        conv3d_reduced::<D>(&y, co, co)
+    };
+    let up = |name: &str, x: &SymTensor, ci: usize, co: usize| {
+        let _g = name_scope(name);
+        basic_deconv3d::<D>(x, ci, co)
+    };
+    let cat = |a: &SymTensor, b: &SymTensor| {
+        a.record_custom(CustomData::new(Cat2Op::<D>::new(256)), &[b], None)
+    };
+
+    let conv1 = down("conv1", x, c, 2 * c);
+    let conv1 = fatt("feature_att_8", &conv1, features[1], 2 * c, feat_dims[1]);
+    let conv2 = down("conv2", &conv1, 2 * c, 4 * c);
+    let conv2 = fatt("feature_att_16", &conv2, features[2], 4 * c, feat_dims[2]);
+    let conv3 = down("conv3", &conv2, 4 * c, 6 * c);
+    let conv3 = fatt("feature_att_32", &conv3, features[3], 6 * c, feat_dims[3]);
+
+    let conv3_up = up("conv3_up", &conv3, 6 * c, 4 * c);
+    let conv2 = agg("agg_0", &cat(&conv3_up, &conv2), 8 * c, 4 * c);
+    let conv2 = fatt(
+        "feature_att_up_16",
+        &conv2,
+        features[2],
+        4 * c,
+        feat_dims[2],
+    );
+    let conv2_up = up("conv2_up", &conv2, 4 * c, 2 * c);
+    let conv1 = agg("agg_1", &cat(&conv2_up, &conv1), 4 * c, 2 * c);
+    let conv1 = fatt("feature_att_up_8", &conv1, features[1], 2 * c, feat_dims[1]);
+    let conv = up("conv1_up", &conv1, 2 * c, c);
+
+    let patch = {
+        let _g = name_scope("conv_patch");
+        let spec = Conv3dSpec {
+            kernel: [4; 3],
+            stride: [4; 3],
+            padding: [0; 3],
+            groups: c,
+            ..Conv3dSpec::cube(c, c, 4, true)
+        };
+        bn3d::<D>("1", &conv3d_spec::<D>("0", x, spec), c)
+    };
+    let att = {
+        let _g = name_scope("atts.4");
+        disparity_attention::<D>(&patch, c)
+    };
+    let att = att.record_custom(
+        CustomData::new(TrilinearUpsampleOp::<D>::new(4, 32)),
+        &[],
+        None,
+    );
+    let conv = add(&conv, &att);
+    let _g = name_scope("conv_out");
+    let conv = {
+        let _r = name_scope("0");
+        conv3d_reduced::<D>(&conv, c, c)
+    };
+    let _r = name_scope("1");
+    conv3d_reduced::<D>(&conv, c, c)
 }

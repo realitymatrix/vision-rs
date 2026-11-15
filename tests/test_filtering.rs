@@ -13,7 +13,7 @@ mod common;
 use common::stereo_block::check_block;
 use serial_test::serial;
 use teeny_core::name_scope::name_scope;
-use vision_rs::models::stereo::filtering::{VOLUME_DIM, corr_stem, feature_att};
+use vision_rs::models::stereo::filtering::{VOLUME_DIM, corr_stem, feature_att, hourglass};
 
 /// `corr_stem` (32 to 28 channels) then `corr_feature_att` with 24-channel features,
 /// on a 6x5x7 volume.
@@ -34,6 +34,77 @@ fn corr_stem_and_feature_att_match_pytorch() -> anyhow::Result<()> {
                 feature_att::<f32>(&stem, &i[1], VOLUME_DIM, 24)
             };
             vec![("stem", stem), ("", out)]
+        },
+        1e-4,
+    )?;
+    Ok(())
+}
+
+/// `cost_agg`: an 8-channel hourglass (4 heads of 2 in the disparity transformer) with
+/// feature widths 8/12/16/20, on a 16x8x16 volume (divisible by 8 for the three
+/// strided levels and by 4 for `conv_patch`).
+#[test]
+#[serial]
+fn hourglass_matches_pytorch() -> anyhow::Result<()> {
+    check_block(
+        "filtering/hourglass",
+        "filtering/hourglass",
+        &[
+            ("cv", &[1, 8, 16, 8, 16]),
+            ("f1", &[1, 12, 4, 8]),
+            ("f2", &[1, 16, 2, 4]),
+            ("f3", &[1, 20, 1, 2]),
+        ],
+        |i| {
+            let _g = name_scope("cost_agg");
+            vec![(
+                "",
+                hourglass::<f32>(&i[0], [&i[1], &i[1], &i[2], &i[3]], 8, [8, 12, 16, 20]),
+            )]
+        },
+        1e-4,
+    )?;
+    Ok(())
+}
+
+/// The whole filtering with a real FoundationStereo checkpoint (`corr_stem`,
+/// `corr_feature_att`, `cost_agg`) on the real combined volume of the sample stereo
+/// pair at 224x320 (`[1, 32, 104, 56, 80]`) with the real left features, against
+/// PyTorch in FP64. Build the fixtures with tests/fixtures/filtering/gen_real.py,
+/// point `FS_REAL_FIXTURES` at the directory holding `filtering_real/` and run with
+/// `--ignored`.
+#[test]
+#[serial]
+#[ignore = "needs FS_REAL_FIXTURES (real-checkpoint fixtures, not committed)"]
+fn filtering_matches_real_checkpoint() -> anyhow::Result<()> {
+    let root = std::env::var("FS_REAL_FIXTURES")
+        .expect("set FS_REAL_FIXTURES to the real-checkpoint fixture directory");
+    let dir = format!("{root}/filtering_real");
+    let feat_dims = [224, 192, 320, 304];
+    check_block(
+        "filtering_real",
+        &dir,
+        &[
+            ("cv", &[1, 32, 104, 56, 80]),
+            ("f0", &[1, 224, 56, 80]),
+            ("f1", &[1, 192, 28, 40]),
+            ("f2", &[1, 320, 14, 20]),
+            ("f3", &[1, 304, 7, 10]),
+        ],
+        |i| {
+            let att = {
+                let stem = {
+                    let _g = name_scope("corr_stem");
+                    corr_stem::<f32>(&i[0], 32, VOLUME_DIM)
+                };
+                let _g = name_scope("corr_feature_att");
+                feature_att::<f32>(&stem, &i[1], VOLUME_DIM, feat_dims[0])
+            };
+            let out = {
+                let _g = name_scope("cost_agg");
+                hourglass::<f32>(&att, [&i[1], &i[2], &i[3], &i[4]], VOLUME_DIM, feat_dims)
+            };
+            vec![("att", att), ("", out)]
         },
         1e-4,
     )?;
