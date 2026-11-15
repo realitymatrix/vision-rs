@@ -33,23 +33,26 @@
 //! and, with `--raw`, the disparity as little-endian f32 (`H x W`, row-major).
 //!
 //! The model runs as three graphs ([`vision_rs::models::stereo::pipeline`]): the prelude
-//! once, the refinement step once per iteration, the upsampling once. Every
-//! intermediate buffer stays allocated (teeny-test's `RuntimeModel` frees nothing), so
-//! memory grows quickly with the image: the default `--scale 0.4` runs FoundationStereo's
-//! 960x540 sample at 384x224, peaking at 13.1 GB on CUDA; at 0.5 (480x288) it does not
-//! fit in 16 GB.
+//! once, the refinement step once per iteration, the upsampling once, each on
+//! [`pooled::PooledModel`], which shares activation buffers between nodes whose
+//! lifetimes do not overlap. On FoundationStereo's 960x540 sample (padded to 960x544)
+//! that takes the prelude's activations from 68.8 GB (one buffer per node) to 3.0 GB;
+//! the whole run peaks at 7.2 GB on CUDA.
+
+mod pooled;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
+use pooled::PooledModel;
 use teeny_core::graph::{DtypeRepr, SymTensor};
 use teeny_core::model::LoweringMode;
 use teeny_core::name_scope::name_scope;
 use teeny_data::safetensors::SafeTensors;
 use teeny_kernels::graph::TritonLowering;
-use teeny_test::model::{RuntimeModel, runtime};
+use teeny_test::model::runtime;
 use vision_rs::models::stereo::filtering::VOLUME_DIM;
 use vision_rs::models::stereo::pipeline::{
     CORR_LEVELS, CORR_RADIUS, PRELUDE_OUTPUTS, normalize_image, prelude,
@@ -86,13 +89,13 @@ struct Args {
     #[arg(long, default_value_t = 32)]
     iters: usize,
     /// Scale applied to both images first (FoundationStereo's `--scale`).
-    #[arg(long, default_value_t = 0.4)]
+    #[arg(long, default_value_t = 1.0)]
     scale: f32,
 }
 
 /// A compiled graph and the DAG nodes of its outputs.
 struct Graph<'d> {
-    model: RuntimeModel<'d>,
+    model: PooledModel<'d>,
     outputs: Vec<usize>,
 }
 
@@ -118,26 +121,22 @@ impl<'d> Graph<'d> {
         let (_, graph_to_dag) =
             lowering.lower_with_mapping(&graph.borrow(), LoweringMode::Inference)?;
         let target = runtime::default_target(device)?;
-        let mut model = RuntimeModel::compile(
-            device,
-            &graph.borrow(),
-            &lowering,
-            LoweringMode::Inference,
-            &target,
-            shapes[0][0],
-            false,
-        )
-        .with_context(|| format!("compiling {label}"))?;
-        let slots: Vec<(String, usize, usize)> = model.param_info_named().collect();
+        let mut model =
+            PooledModel::compile(device, &graph.borrow(), &lowering, &target, shapes[0][0])
+                .with_context(|| format!("compiling {label}"))?;
+        let slots = model.param_info_named();
         for (slot, node, idx) in &slots {
             let key = torch_key(slot);
             let data = weights(&key).with_context(|| format!("{label}: weight {key}"))?;
             model.load_param_f32(*node, *idx, &data)?;
         }
         println!(
-            "{label}: compiled, {} weight slots loaded ({:.1} s)",
+            "{label}: compiled, {} weight slots loaded ({:.1} s); activations {:.2} GB \
+             (one buffer per node: {:.2} GB)",
             slots.len(),
-            t.elapsed().as_secs_f32()
+            t.elapsed().as_secs_f32(),
+            model.pooled_bytes as f64 / 1e9,
+            model.unpooled_bytes as f64 / 1e9,
         );
         Ok(Self {
             model,
