@@ -19,10 +19,11 @@
 //! (`core/foundation_stereo.py`).
 //!
 //! Written as a gather: output `o` along an axis takes input `i = (o + 1 - k) / 2` for
-//! the taps `k` where `o + 1 - k` is even and `i` in range, two of the four.
+//! the taps `k` where `o + 1 - k` is even and `i` in range, two of the four. The loop
+//! visits only those parity-matched taps, `CIN * 8` per output instead of `CIN * 64`.
 //! **Layout**: input `[B, CIN, D, H, W]`, weight `[CIN, COUT, 4, 4, 4]` (PyTorch's),
 //! output `[B, COUT, 2D, 2H, 2W]`. Grid: `B * COUT * 2D * 2H * ceil(2W / BLOCK)`, lanes
-//! on output columns; the `CIN * 64` taps are one flat loop, invalid ones weighted 0.
+//! on output columns; out-of-range taps are weighted 0.
 
 use teeny_core::dtype::{AddOffsets, Comparison, Float, Tensor};
 use teeny_macros::kernel;
@@ -70,31 +71,32 @@ pub fn conv_transpose3d_k4s2p1_forward<T: Triton, D: Float, const BLOCK: i32>(
     let m = ow.lt(OW);
     let zeros = T::zeros::<D>(&[BLOCK]);
     let izero = T::zeros::<i32>(&[BLOCK]);
-    let one = T::full(&[BLOCK], D::from_f64(1.0));
     let half = T::full(&[BLOCK], D::from_f64(0.5));
 
+    // Only taps whose parity matches the output reach it: along depth and row that is
+    // kd = kd0 + 2a, kh = kh0 + 2b (scalars per program), along columns kw = kw0 + 2c
+    // with kw0 per lane. Input index = (o + 1 - k0) / 2 - {a, b, c}.
+    let kd0 = (od + 1) % 2;
+    let kh0 = (oh + 1) % 2;
+    let qd = (od + 1 - kd0) / 2;
+    let qh = (oh + 1 - kh0) / 2;
+    let nw = ow + 1;
+    let qw = T::cast::<D, i32>(
+        T::floor(T::cast::<i32, D>(nw, None, false) * half),
+        None,
+        false,
+    );
+    let kw0 = nw + qw * (-2); // 0 or 1 per lane
+
     let mut acc = T::zeros::<D>(&[BLOCK]);
-    for t in 0..CIN * 64 {
-        let i = t / 64;
-        let k = t % 64;
-        let kd = k / 16;
-        let kh = (k / 4) % 4;
-        let kw = k % 4;
-        // Depth and row: scalar per program. +4 keeps the numerators non-negative for %.
-        let nd = od + 1 - kd;
-        let nh = oh + 1 - kh;
-        let pd = (nd + 4) % 2;
-        let ph = (nh + 4) % 2;
-        let idt = izero + ((nd + 4) / 2 - 2);
-        let iht = izero + ((nh + 4) / 2 - 2);
-        // Column: per lane, by float floor.
-        let nw = ow + (1 - kw);
-        let iw = T::cast::<D, i32>(
-            T::floor(T::cast::<i32, D>(nw, None, false) * half),
-            None,
-            false,
-        );
-        let pw = T::cast::<i32, D>(nw + iw * (-2), None, false); // 0 even, 1 odd
+    for t in 0..CIN * 8 {
+        let i = t / 8;
+        let a = (t / 4) % 2;
+        let bb = (t / 2) % 2;
+        let c = t % 2;
+        let idt = izero + (qd - a);
+        let iht = izero + (qh - bb);
+        let iw = qw + (-c);
         let idc = T::maximum(T::minimum(idt, izero + (DD - 1)), izero);
         let ihc = T::maximum(T::minimum(iht, izero + (HH - 1)), izero);
         let iwc = T::maximum(T::minimum(iw, izero + (WW - 1)), izero);
@@ -114,18 +116,19 @@ pub fn conv_transpose3d_k4s2p1_forward<T: Triton, D: Float, const BLOCK: i32>(
         let x = T::where_(iht.lt(HH), x, zeros);
         let x = T::where_(iw.ge(0), x, zeros);
         let x = T::where_(iw.lt(WW), x, zeros);
-        let parity = (one - pw) * T::cast::<i32, D>(izero + (1 - pd) * (1 - ph), None, false);
+        let kd = kd0 + 2 * a;
+        let kh = kh0 + 2 * bb;
         let w = T::load(
-            w_ptr.add_offsets(izero + ((i * COUT + o) * 64 + k)),
-            None,
-            None,
+            w_ptr.add_offsets(kw0 + ((i * COUT + o) * 64 + kd * 16 + kh * 4 + 2 * c)),
+            Some(m),
+            Some(zeros),
             &[],
             None,
             None,
             None,
             false,
         );
-        acc = acc + x * w * parity;
+        acc = acc + x * w;
     }
     T::store(
         out_ptr.add_offsets(ow + (((b * COUT + o) * OD + od) * OH + oh) * OW),
