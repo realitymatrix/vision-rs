@@ -27,6 +27,10 @@
 //! `[B, COUT, OD, OH, OW]`. Grid: `B * COUT * OD * OH * ceil(OW / BLOCK)`, lanes on
 //! output columns; the `CIN / G * KD * KH * KW` taps are one flat loop (no nested
 //! loops, teenygrad/teenygrad#156), each tap's weight broadcast across the lanes.
+//!
+//! When `COUT / G` is a multiple of 4, `conv3d_direct4_forward` runs instead: each
+//! program computes four consecutive output channels, so every input load, its index
+//! arithmetic and its bounds masks are shared by four accumulators (grid divided by 4).
 
 use teeny_core::dtype::{AddOffsets, Comparison, Float, Tensor};
 use teeny_macros::kernel;
@@ -160,6 +164,222 @@ pub fn conv3d_direct_forward<T: Triton, D: Float, const BLOCK: i32>(
     );
 }
 
+/// The convolution above, four output channels per program (`COUT / G` a multiple
+/// of 4): every input load and bounds check feeds four accumulators.
+// `#[kernel]` requires the `Triton` bound inline on the type parameter, while the
+// `I32Tensor == Tensor<i32>` equality can only be written in the where clause.
+#[allow(clippy::multiple_bound_locations)]
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn conv3d_direct4_forward<T: Triton, D: Float, const BLOCK: i32>(
+    x_ptr: InPtr<T::Pointer<D>>,
+    w_ptr: InPtr<T::Pointer<D>>,
+    b_ptr: InPtr<T::Pointer<D>>,
+    out_ptr: OutPtr<T::Pointer<D>>,
+    CIN: i32,
+    COUT: i32,
+    G: i32,
+    DD: i32,
+    HH: i32,
+    WW: i32,
+    OD: i32,
+    OH: i32,
+    OW: i32,
+    KER: i32,
+    STR: i32,
+    PAD: i32,
+) where
+    T: Triton<I32Tensor = <T as Triton>::Tensor<i32>>,
+    T::I32Tensor: Tensor<i32, 1>,
+    T::I32Tensor: core::ops::Add<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Mul<i32, Output = T::I32Tensor>,
+    T::I32Tensor: core::ops::Add<T::I32Tensor, Output = T::I32Tensor>,
+    T::I32Tensor: Comparison<i32, BoolTensor = T::BoolTensor>,
+    T::Pointer<D>: AddOffsets<i32, 1, T::I32Tensor, Output = T::Tensor<T::Pointer<D>>>,
+{
+    // Kernel size, stride and padding arrive packed as `d << 10 | h << 5 | w` (kernels
+    // take at most 20 arguments).
+    let KD = KER / 1024;
+    let KH = (KER / 32) % 32;
+    let KW = KER % 32;
+    let SD = STR / 1024;
+    let SH = (STR / 32) % 32;
+    let SW = STR % 32;
+    let PD = PAD / 1024;
+    let PH = (PAD / 32) % 32;
+    let PW = PAD % 32;
+    let cin_g = CIN / G;
+    let cout_g = COUT / G;
+    let tiles = (OW + BLOCK - 1) / BLOCK;
+    let pid = T::program_id(Axis::X);
+    let tile = pid % tiles;
+    let r1 = pid / tiles;
+    let oh = r1 % OH;
+    let r2 = r1 / OH;
+    let od = r2 % OD;
+    let r3 = r2 / OD;
+    let o = (r3 % (COUT / 4)) * 4;
+    let b = r3 / (COUT / 4);
+    let grp = o / cout_g;
+
+    let ow = T::arange(0, BLOCK) + tile * BLOCK;
+    let m = ow.lt(OW);
+    let zeros = T::zeros::<D>(&[BLOCK]);
+    let izero = T::zeros::<i32>(&[BLOCK]);
+    let iw0 = ow * SW + (-PW);
+
+    let mut acc0 = T::load(
+        b_ptr.add_offsets(izero + o),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut acc1 = T::load(
+        b_ptr.add_offsets(izero + (o + 1)),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut acc2 = T::load(
+        b_ptr.add_offsets(izero + (o + 2)),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut acc3 = T::load(
+        b_ptr.add_offsets(izero + (o + 3)),
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        false,
+    );
+    let ktaps = KD * KH * KW;
+    for t in 0..cin_g * ktaps {
+        let ci = t / ktaps;
+        let k = t % ktaps;
+        let kd = k / (KH * KW);
+        let kh = (k / KW) % KH;
+        let kw = k % KW;
+        let id = od * SD - PD + kd;
+        let ih = oh * SH - PH + kh;
+        // Bounds as lane tensors: teenyc compiles no scalar branches or comparisons.
+        let idt = izero + id;
+        let iht = izero + ih;
+        let iw = iw0 + kw;
+        let idc = T::maximum(T::minimum(idt, izero + (DD - 1)), izero);
+        let ihc = T::maximum(T::minimum(iht, izero + (HH - 1)), izero);
+        let iwc = T::maximum(T::minimum(iw, izero + (WW - 1)), izero);
+        let c = grp * cin_g + ci;
+        let x = T::load(
+            x_ptr.add_offsets(iwc + ((idc + (b * CIN + c) * DD) * HH + ihc) * WW),
+            Some(m),
+            Some(zeros),
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        let x = T::where_(iw.ge(0), x, zeros);
+        let x = T::where_(iw.lt(WW), x, zeros);
+        let x = T::where_(idt.ge(0), x, zeros);
+        let x = T::where_(idt.lt(DD), x, zeros);
+        let x = T::where_(iht.ge(0), x, zeros);
+        let x = T::where_(iht.lt(HH), x, zeros);
+        let w0 = T::load(
+            w_ptr.add_offsets(izero + ((o * cin_g + ci) * ktaps + k)),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        acc0 = acc0 + x * w0;
+        let w1 = T::load(
+            w_ptr.add_offsets(izero + (((o + 1) * cin_g + ci) * ktaps + k)),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        acc1 = acc1 + x * w1;
+        let w2 = T::load(
+            w_ptr.add_offsets(izero + (((o + 2) * cin_g + ci) * ktaps + k)),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        acc2 = acc2 + x * w2;
+        let w3 = T::load(
+            w_ptr.add_offsets(izero + (((o + 3) * cin_g + ci) * ktaps + k)),
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        acc3 = acc3 + x * w3;
+    }
+    T::store(
+        out_ptr.add_offsets(ow + (((b * COUT + o) * OD + od) * OH + oh) * OW),
+        acc0,
+        Some(m),
+        &[],
+        None,
+        None,
+    );
+    T::store(
+        out_ptr.add_offsets(ow + (((b * COUT + o + 1) * OD + od) * OH + oh) * OW),
+        acc1,
+        Some(m),
+        &[],
+        None,
+        None,
+    );
+    T::store(
+        out_ptr.add_offsets(ow + (((b * COUT + o + 2) * OD + od) * OH + oh) * OW),
+        acc2,
+        Some(m),
+        &[],
+        None,
+        None,
+    );
+    T::store(
+        out_ptr.add_offsets(ow + (((b * COUT + o + 3) * OD + od) * OH + oh) * OW),
+        acc3,
+        Some(m),
+        &[],
+        None,
+        None,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Graph-level op
 // ---------------------------------------------------------------------------
@@ -203,6 +423,11 @@ impl Conv3dSpec {
             groups: 1,
             bias,
         }
+    }
+
+    /// Whether the four-channel kernel applies: `cout / groups` a multiple of 4.
+    fn blocked(&self) -> bool {
+        (self.cout / self.groups).is_multiple_of(4)
     }
 
     fn out_size(&self, i: usize, n: usize) -> usize {
@@ -257,10 +482,16 @@ impl<D: FloatBytes + Send + Sync + 'static> CustomOp for Conv3dDirectOp<D> {
     }
 
     fn lower(&self) -> Option<(String, String, String, Arc<dyn RuntimeOp>)> {
-        let kernel = Conv3dDirectForward::<D>::new(self.block);
+        let (name, source) = if self.spec.blocked() {
+            let k = Conv3dDirect4Forward::<D>::new(self.block);
+            ("conv3d_direct4_forward", k.source)
+        } else {
+            let k = Conv3dDirectForward::<D>::new(self.block);
+            ("conv3d_direct_forward", k.source)
+        };
         Some((
-            "conv3d_direct_forward".to_string(),
-            kernel.source,
+            name.to_string(),
+            source,
             "entry_point".to_string(),
             Arc::new(Conv3dDirectRuntimeOp::<D> {
                 spec: self.spec,
@@ -348,8 +579,9 @@ impl<D: FloatBytes + Send + Sync + 'static> RuntimeOp for Conv3dDirectRuntimeOp<
 
     fn grid(&self, output_shape: &[usize]) -> [u32; 3] {
         let tiles = output_shape[4].div_ceil(self.block as usize);
+        let per = if self.spec.blocked() { 4 } else { 1 };
         [
-            (output_shape[..4].iter().product::<usize>() * tiles) as u32,
+            (output_shape[..4].iter().product::<usize>() / per * tiles) as u32,
             1,
             1,
         ]
