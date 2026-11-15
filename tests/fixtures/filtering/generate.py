@@ -15,6 +15,11 @@ and under hourglass/:
     w__cost_agg.*           `hourglass(cfg={'max_disp': 64}, in_channels=8,
                             feat_dims=[8, 12, 16, 20])`, LayerNorm affines randomised
     expected.bin            [1, 8, 16, 8, 16]
+and under classifier/:
+    geo.bin                 filtered volume [1, 8, 12, 5, 7]
+    w__classifier.*         the classifier's Sequential for volume_dim 8
+    expected_logits.bin     classifier(geo), [1, 1, 12, 5, 7]
+    expected_disp.bin       disparity_regression(softmax(logits.squeeze(1), 1), 12)
 
     python generate.py --fs ~/Documents/osn/FoundationStereo
 """
@@ -108,6 +113,27 @@ def main():
             write(d, f"w__cost_agg.{k}.bin", v)
     with torch.no_grad():
         write(d, "expected.bin", hg(cv, feats))
+    from core.submodule import disparity_regression
+    cls = nn.Sequential(
+        BasicConv(8, 4, kernel_size=3, padding=1, is_3d=True),
+        ResnetBasicBlock3D(4, 4, kernel_size=3, stride=1, padding=1),
+        nn.Conv3d(4, 1, kernel_size=7, padding=3),
+    )
+    randomise(cls, g)
+    cls = cls.double().eval()
+    d = os.path.join(HERE, "classifier")
+    for f in os.listdir(d) if os.path.isdir(d) else []:
+        os.remove(os.path.join(d, f))
+    geo = torch.randn(1, 8, 12, 5, 7, generator=g, dtype=torch.float64)
+    write(d, "geo.bin", geo)
+    for k, v in cls.state_dict().items():
+        if not k.endswith("num_batches_tracked"):
+            write(d, f"w__classifier.{k}.bin", v)
+    with torch.no_grad():
+        logits = cls(geo)
+        write(d, "expected_logits.bin", logits)
+        prob = torch.softmax(logits.squeeze(1), dim=1)
+        write(d, "expected_disp.bin", disparity_regression(prob, 12))
     print("ok")
 
 

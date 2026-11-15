@@ -13,7 +13,9 @@ mod common;
 use common::stereo_block::check_block;
 use serial_test::serial;
 use teeny_core::name_scope::name_scope;
-use vision_rs::models::stereo::filtering::{VOLUME_DIM, corr_stem, feature_att, hourglass};
+use vision_rs::models::stereo::filtering::{
+    VOLUME_DIM, classifier, corr_stem, feature_att, hourglass, init_disp,
+};
 
 /// `corr_stem` (32 to 28 channels) then `corr_feature_att` with 24-channel features,
 /// on a 6x5x7 volume.
@@ -107,6 +109,57 @@ fn filtering_matches_real_checkpoint() -> anyhow::Result<()> {
             vec![("att", att), ("", out)]
         },
         1e-4,
+    )?;
+    Ok(())
+}
+
+/// `classifier` for an 8-channel volume (12x5x7) and the initial disparity from its
+/// logits (softmax over the 12 disparities, then the expectation).
+#[test]
+#[serial]
+fn classifier_and_init_disp_match_pytorch() -> anyhow::Result<()> {
+    check_block(
+        "filtering/classifier",
+        "filtering/classifier",
+        &[("geo", &[1, 8, 12, 5, 7])],
+        |i| {
+            let logits = {
+                let _g = name_scope("classifier");
+                classifier::<f32>(&i[0], 8)
+            };
+            let disp = init_disp::<f32>(&logits);
+            vec![("logits", logits), ("disp", disp)]
+        },
+        1e-4,
+    )?;
+    Ok(())
+}
+
+/// The classifier with a real FoundationStereo checkpoint on the real `cost_agg`
+/// output of the sample stereo pair (`[1, 28, 104, 56, 80]`), and the initial
+/// disparity, against PyTorch in FP64. Fixtures from
+/// tests/fixtures/filtering/gen_real.py (`classifier_real/` under `FS_REAL_FIXTURES`);
+/// run with `--ignored`.
+#[test]
+#[serial]
+#[ignore = "needs FS_REAL_FIXTURES (real-checkpoint fixtures, not committed)"]
+fn classifier_matches_real_checkpoint() -> anyhow::Result<()> {
+    let root = std::env::var("FS_REAL_FIXTURES")
+        .expect("set FS_REAL_FIXTURES to the real-checkpoint fixture directory");
+    let dir = format!("{root}/classifier_real");
+    check_block(
+        "classifier_real",
+        &dir,
+        &[("geo", &[1, VOLUME_DIM, 104, 56, 80])],
+        |i| {
+            let logits = {
+                let _g = name_scope("classifier");
+                classifier::<f32>(&i[0], VOLUME_DIM)
+            };
+            let disp = init_disp::<f32>(&logits);
+            vec![("logits", logits), ("disp", disp)]
+        },
+        2e-4,
     )?;
     Ok(())
 }

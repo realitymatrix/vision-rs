@@ -14,6 +14,11 @@ Writes to <out>/filtering_real/:
     w__<key>.bin            `corr_stem.*`, `corr_feature_att.*`, `cost_agg.*`
     expected_att.bin        corr_feature_att(corr_stem(cv), f0), [1, 28, 104, 56, 80]
     expected.bin            cost_agg(that, features)
+and to <out>/classifier_real/ (the classifier on that `cost_agg` output, rounded to f32):
+    geo.bin                 [1, 28, 104, 56, 80]
+    w__classifier.*.bin
+    expected_logits.bin     [1, 1, 104, 56, 80]
+    expected_disp.bin       init_disp [1, 1, 56, 80]
 
     python gen_real.py --fs ~/Documents/osn/FoundationStereo \\
         --run pretrained_models/23-51-11 --out ~/.cache/vision-rs/fs_fixtures
@@ -56,12 +61,15 @@ def main():
     p.add_argument("--fs", required=True)
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--classifier-only", action="store_true",
+                   help="write classifier_real/ only, leaving filtering_real/ as it is")
     a = p.parse_args()
     sys.path.insert(0, a.fs)
     from core.extractor import Feature
     from core.foundation_stereo import hourglass
     from core.submodule import (BasicConv, FeatureAtt, ResnetBasicBlock3D,
-                                build_concat_volume, build_gwc_volume)
+                                build_concat_volume, build_gwc_volume,
+                                disparity_regression)
 
     ckpt = torch.load(os.path.join(a.fs, a.run, "model_best_bp2.pth"),
                       weights_only=False, map_location="cpu")["model"]
@@ -92,20 +100,44 @@ def main():
         v = att(stem(cv), fl[0])
         out = agg(v, fl)
 
-    d = os.path.join(a.out, "filtering_real")
+    if not a.classifier_only:
+        d = os.path.join(a.out, "filtering_real")
+        os.makedirs(d, exist_ok=True)
+        for f in os.listdir(d):
+            os.remove(os.path.join(d, f))
+        write(d, "cv.bin", cv)
+        for i, t in enumerate(fl):
+            write(d, f"f{i}.bin", t)
+        for prefix, m in [("corr_stem", stem), ("corr_feature_att", att), ("cost_agg", agg)]:
+            for k, t in m.state_dict().items():
+                if not k.endswith("num_batches_tracked"):
+                    write(d, f"w__{prefix}.{k}.bin", t)
+        write(d, "expected_att.bin", v)
+        write(d, "expected.bin", out)
+    print([tuple(t.shape) for t in fl], tuple(out.shape), float(out.abs().max()))
+
+    cls = nn.Sequential(
+        BasicConv(vd, vd // 2, kernel_size=3, padding=1, is_3d=True),
+        ResnetBasicBlock3D(vd // 2, vd // 2, kernel_size=3, stride=1, padding=1),
+        nn.Conv3d(vd // 2, 1, kernel_size=7, padding=3),
+    )
+    cls.load_state_dict(sub(ckpt, "classifier."))
+    cls = cls.double().eval()
+    with torch.no_grad():
+        geo = f32(out)
+        logits = cls(geo)
+        disp = disparity_regression(torch.softmax(logits.squeeze(1), dim=1), 104)
+    d = os.path.join(a.out, "classifier_real")
     os.makedirs(d, exist_ok=True)
     for f in os.listdir(d):
         os.remove(os.path.join(d, f))
-    write(d, "cv.bin", cv)
-    for i, t in enumerate(fl):
-        write(d, f"f{i}.bin", t)
-    for prefix, m in [("corr_stem", stem), ("corr_feature_att", att), ("cost_agg", agg)]:
-        for k, t in m.state_dict().items():
-            if not k.endswith("num_batches_tracked"):
-                write(d, f"w__{prefix}.{k}.bin", t)
-    write(d, "expected_att.bin", v)
-    write(d, "expected.bin", out)
-    print([tuple(t.shape) for t in fl], tuple(out.shape), float(out.abs().max()))
+    write(d, "geo.bin", geo)
+    for k, t in cls.state_dict().items():
+        if not k.endswith("num_batches_tracked"):
+            write(d, f"w__classifier.{k}.bin", t)
+    write(d, "expected_logits.bin", logits)
+    write(d, "expected_disp.bin", disp)
+    print(tuple(disp.shape), float(disp.min()), float(disp.max()))
 
 
 if __name__ == "__main__":

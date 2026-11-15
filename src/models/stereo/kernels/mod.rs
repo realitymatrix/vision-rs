@@ -17,6 +17,7 @@ pub mod conv_transpose3d_k4s2p1;
 pub mod conv_transpose_patch;
 pub mod correlation;
 pub mod disp_pos_embed;
+pub mod disparity_regression;
 pub mod gated_blend;
 pub mod gelu_erf;
 pub mod geo_lookup;

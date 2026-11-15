@@ -45,6 +45,7 @@ use crate::models::stereo::kernels::{
     conv_transpose3d_k4s2p1::ConvTranspose3dK4s2p1Op,
     conv3d_direct::{Conv3dDirectOp, Conv3dSpec},
     disp_pos_embed::DispPosEmbedOp,
+    disparity_regression::DisparityRegressionOp,
     head_attn_apply::HeadAttnApplyOp,
     head_attn_logits::HeadAttnLogitsOp,
     trilinear_upsample::TrilinearUpsampleOp,
@@ -370,4 +371,32 @@ pub fn hourglass<D: Float + FloatBytes + Send + Sync + 'static>(
     };
     let _r = name_scope("1");
     conv3d_reduced::<D>(&conv, c, c)
+}
+
+/// `classifier` on the filtered volume (`c` channels): `BasicConv` 3-D to `c / 2`, a
+/// `ResnetBasicBlock3D`, and a 7x7x7 conv with bias to one channel, `[B, 1, D, H, W]`.
+pub fn classifier<D: Float + FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    c: usize,
+) -> SymTensor {
+    let h = c / 2;
+    let x = {
+        let _g = name_scope("0");
+        basic_conv3d::<D>(x, c, h, 3)
+    };
+    let x = {
+        let _g = name_scope("1");
+        resnet_basic_block3d::<D>(&x, h)
+    };
+    conv3d::<D>("2", &x, h, 1, 7, true)
+}
+
+/// `disparity_regression(F.softmax(logits.squeeze(1), dim=1))`: the initial
+/// disparity `[B, 1, H, W]` at 1/4 resolution from the classifier's logits.
+pub fn init_disp<D: FloatBytes + Send + Sync + 'static>(logits: &SymTensor) -> SymTensor {
+    logits.record_custom(
+        CustomData::new(DisparityRegressionOp::<D>::new(256)),
+        &[],
+        None,
+    )
 }
