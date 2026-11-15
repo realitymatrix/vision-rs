@@ -1,6 +1,7 @@
 //! Kernels specific to stereo matching.
 
 pub mod avg_pool2d_padded;
+pub mod batch_norm_inference;
 pub mod bilinear_sampler_1d;
 pub mod cat2;
 pub mod channel_gate;
@@ -10,6 +11,7 @@ pub mod channel_slice;
 pub mod channel_softmax;
 pub mod concat_volume;
 pub mod context_upsample;
+pub mod conv3d_direct;
 pub mod conv_transpose2d_k4s2p1;
 pub mod conv_transpose_patch;
 pub mod correlation;
@@ -31,5 +33,6 @@ pub mod token_attn_logits;
 pub mod unfold3x3;
 pub mod vit_patches;
 pub mod vit_tokens;
+pub mod volume_gate;
 pub mod xca_apply;
 pub mod xca_gram;
