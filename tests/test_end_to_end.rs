@@ -1,7 +1,8 @@
 // FoundationStereo end to end with a real checkpoint: the prelude graph (features,
 // cost volume and filtering, initial disparity, context, geometry pyramid, stem), the
 // refinement step graph run in the host loop, and the upsampling graph, against the
-// model's own `forward` in FP64 on the sample stereo pair at 224x320.
+// model's own `forward` in FP64 on the sample stereo pair, at 224x320 and, small enough
+// for RISC-V under qemu, at 128x160.
 //
 // Build the fixtures with tests/fixtures/end_to_end/gen_real.py, point
 // `FS_REAL_FIXTURES` at the directory holding `end_to_end_real/` and run with
@@ -26,21 +27,33 @@ use vision_rs::models::stereo::update::{
     upsample::upsample_disp,
 };
 
-const ITERS: usize = 4;
-const H: usize = 224;
-const W: usize = 320;
-
-/// `FoundationStereo.forward(left, right, iters=4)`: the initial disparity at 1/4
-/// resolution and the upsampled full-resolution disparity after every step.
-/// Full-resolution disparities reach ~45 px, so the tolerances are absolute (5e-3 px,
-/// ~1e-4 relative).
+/// `FoundationStereo.forward(left, right, iters=4)` on the sample pair at 224x320: the
+/// initial disparity at 1/4 resolution and the upsampled full-resolution disparity after
+/// every step. Full-resolution disparities reach ~45 px, so the tolerances are absolute
+/// (5e-3 px, ~1e-4 relative).
 #[test]
 #[serial]
 #[ignore = "needs FS_REAL_FIXTURES (real-checkpoint fixtures, not committed)"]
 fn foundation_stereo_matches_real_checkpoint() -> anyhow::Result<()> {
+    run("end_to_end_real", 224, 320, 4)
+}
+
+/// The same at 128x160 with 2 steps (`gen_real.py --size 128 160 --iters 2 --name
+/// end_to_end_small`): the whole model, small enough to finish under qemu on RISC-V.
+#[test]
+#[serial]
+#[ignore = "needs FS_REAL_FIXTURES (real-checkpoint fixtures, not committed)"]
+fn foundation_stereo_small_matches_real_checkpoint() -> anyhow::Result<()> {
+    run("end_to_end_small", 128, 160, 2)
+}
+
+/// Runs the three graphs on fixture directory `name` (an `h x w` pair, `iters` steps)
+/// and checks the initial disparity and every step's upsampled disparity.
+#[allow(non_snake_case)]
+fn run(name: &str, H: usize, W: usize, ITERS: usize) -> anyhow::Result<()> {
     let root = std::env::var("FS_REAL_FIXTURES")
         .expect("set FS_REAL_FIXTURES to the real-checkpoint fixture directory");
-    let dir = format!("{root}/end_to_end_real");
+    let dir = format!("{root}/{name}");
     let f = |n: &str| fixture(&dir, &format!("{n}.bin"));
     let device = teeny_test::model::runtime::open()?;
 
@@ -48,22 +61,22 @@ fn foundation_stereo_matches_real_checkpoint() -> anyhow::Result<()> {
     let img: &[usize] = &[1, 3, H, W];
     let mut pre = Block::new(
         &device,
-        "end_to_end/prelude",
+        &format!("{name}/prelude"),
         &format!("{dir}/prelude"),
         &[("left", img), ("right", img)],
         |i| prelude::<f32>(&i[0], &i[1], (H, W)),
     )?;
     let out = pre.run(&[&f("left"), &f("right")])?;
-    let get = |name: &str| {
+    let get = |out_name: &str| {
         let i = PRELUDE_OUTPUTS
             .iter()
             .chain(&["stem_2x"])
-            .position(|n| *n == name)
+            .position(|n| *n == out_name)
             .unwrap();
         &out[i]
     };
     compare(
-        "end_to_end/init_disp",
+        &format!("{name}/init_disp"),
         get("disp"),
         &f("expected_init_disp"),
         1e-3,
@@ -87,7 +100,7 @@ fn foundation_stereo_matches_real_checkpoint() -> anyhow::Result<()> {
         .collect();
     let mut step = Block::new(
         &device,
-        "end_to_end/step",
+        &format!("{name}/step"),
         &format!("{dir}/step"),
         &inputs,
         |i| {
@@ -100,7 +113,7 @@ fn foundation_stereo_matches_real_checkpoint() -> anyhow::Result<()> {
     let c = dims.mask_out;
     let mut up = Block::new(
         &device,
-        "end_to_end/upsample",
+        &format!("{name}/upsample"),
         &format!("{dir}/upsample"),
         &[
             ("disp", &[1, 1, H / 4, W / 4]),
@@ -138,13 +151,13 @@ fn foundation_stereo_matches_real_checkpoint() -> anyhow::Result<()> {
                 .expect("upsample")
                 .remove(0);
             worst = worst.max(compare(
-                &format!("end_to_end/disp_it{it}"),
+                &format!("{name}/disp_it{it}"),
                 &disp,
                 &f(&format!("expected_disp_it{it}")),
                 5e-3,
             ));
         },
     )?;
-    println!("end_to_end: worst |disp - torch| over {ITERS} steps = {worst}");
+    println!("{name}: worst |disp - torch| over {ITERS} steps = {worst}");
     Ok(())
 }
