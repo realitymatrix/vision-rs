@@ -13,6 +13,7 @@ pub mod gated_blend;
 pub mod gelu_erf;
 pub mod geo_lookup;
 pub mod instance_norm3d;
+pub mod interpolate_bicubic;
 pub mod interpolate_bilinear;
 pub mod l2_normalize;
 pub mod leaky_relu;

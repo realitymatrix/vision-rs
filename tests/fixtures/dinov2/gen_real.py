@@ -6,9 +6,12 @@ through `get_intermediate_layers(x, [4, 11, 17, 23], return_class_token=True)`, 
 
 The image is prepared as `Feature.forward` prepares it for the branch: resized to
 224x320 and normalised (as gen_real.py of the decoder does), then bicubic-resized to
-224x336, the next multiple of lcm(14, 16) = 112. That resize is not yet ported, so its
-output is the test input. Writes to <out>/dinov2_real/:
-    x.bin                       the resized image [1, 3, 224, 336], f32
+224x336, the next multiple of lcm(14, 16) = 112, in FP32 as `Feature` runs it. The
+resize's output is the ViT test's input; the image and the resize are also the
+fixtures of `bicubic_resize_matches_real_image` (tests/test_interpolate_bicubic.rs).
+Writes to <out>/dinov2_real/:
+    image.bin                   the normalised image [1, 3, 224, 320], f32
+    x.bin, expected_x.bin       the resized image [1, 3, 224, 336], f32
     w__pretrained.<key>.bin     the ViT's weights
     expected_l{4,11,17,23}.bin  normed patch grids [1, 1024, 16, 24]
 
@@ -64,7 +67,9 @@ def main():
     os.makedirs(d, exist_ok=True)
     for f in os.listdir(d):
         os.remove(os.path.join(d, f))
+    write(d, "image.bin", x)
     write(d, "x.bin", x_in)
+    write(d, "expected_x.bin", x_in)
     for k, v in vit.state_dict().items():
         if k != "mask_token":
             write(d, f"w__pretrained.{k}.bin", v)

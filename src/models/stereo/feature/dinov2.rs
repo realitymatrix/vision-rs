@@ -39,8 +39,9 @@ use teeny_core::{
 };
 
 use crate::models::stereo::kernels::{
-    channel_layer_norm::ChannelLayerNormOp, token_attn_apply::TokenAttnApplyOp,
-    token_attn_logits::TokenAttnLogitsOp, vit_patches::VitPatchesOp, vit_tokens::VitTokensOp,
+    channel_layer_norm::ChannelLayerNormOp, interpolate_bicubic::InterpolateBicubicOp,
+    token_attn_apply::TokenAttnApplyOp, token_attn_logits::TokenAttnLogitsOp,
+    vit_patches::VitPatchesOp, vit_tokens::VitTokensOp,
 };
 use crate::models::stereo::update::ops::{add, channel_scale, conv, gelu};
 
@@ -203,4 +204,54 @@ pub fn encoder<D: Float + FloatBytes + Send + Sync + 'static>(
         }
     }
     out
+}
+
+/// `Feature.forward`'s resize divider, `lcm(patch 14, 16)`.
+pub const RESIZE_DIVIDER: usize = 112;
+/// `Feature.forward`'s `max_H` and `max_W`.
+pub const RESIZE_MAX: usize = 1344;
+
+/// The size `Feature.forward` resizes an `h x w` image to for the ViT:
+/// FoundationStereo's `get_resize_keep_aspect_ratio(h, w, divider=112, max_H=1344,
+/// max_W=1344)`. Each side rounds up to a multiple of 112; if either then exceeds 1344,
+/// the longer becomes 1344 and the other scales with it (rounded up again).
+pub fn branch_input_size(h: usize, w: usize) -> (usize, usize) {
+    let (d, max) = (RESIZE_DIVIDER, RESIZE_MAX);
+    let round = |x: f64| ((x / d as f64).ceil() as usize) * d;
+    let (hr, wr) = (round(h as f64), round(w as f64));
+    if hr <= max && wr <= max {
+        (hr, wr)
+    } else if hr > wr {
+        (max, round(wr as f64 * max as f64 / hr as f64))
+    } else {
+        (round(hr as f64 * max as f64 / wr as f64), max)
+    }
+}
+
+/// `F.interpolate(x, size, mode="bicubic", align_corners=False)`: the image resize in
+/// front of the ViT, to [`branch_input_size`].
+pub fn resize_input<D: FloatBytes + Send + Sync + 'static>(
+    x: &SymTensor,
+    size: (usize, usize),
+) -> SymTensor {
+    x.record_custom(
+        CustomData::new(InterpolateBicubicOp::<D>::new(size, 64)),
+        &[],
+        None,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::branch_input_size;
+
+    #[test]
+    fn branch_input_size_matches_foundation_stereo() {
+        // Values from FoundationStereo's `get_resize_keep_aspect_ratio`.
+        assert_eq!(branch_input_size(224, 320), (224, 336));
+        assert_eq!(branch_input_size(480, 640), (560, 672));
+        assert_eq!(branch_input_size(1080, 1920), (784, 1344));
+        assert_eq!(branch_input_size(2000, 1500), (1344, 1120));
+        assert_eq!(branch_input_size(1344, 1344), (1344, 1344));
+    }
 }
