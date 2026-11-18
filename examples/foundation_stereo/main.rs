@@ -231,8 +231,157 @@ fn turbo(t: f32) -> [u8; 3] {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// AOT kernel compile - driven by `cargo teeny aot` / `cargo teeny package`
+// ---------------------------------------------------------------------------
+//
+// `cargo teeny package --target spacemit-k3 --example foundation_stereo` builds this
+// example for the host and re-runs it with --device/--options/--cache-dir/--force
+// forwarded verbatim, expecting it to compile its kernels into the package's `cache/`
+// (as examples/yolo26.rs does). We detect that shape before `Args::parse()`, which
+// would otherwise reject `--device`.
+//
+// Unlike YOLO26 this model is three graphs, not one, and every shape follows from the
+// padded image size, so the kernels are only reusable at the size they were compiled
+// for. `--aot-height`/`--aot-width` are the *unpadded* size the board will run, and
+// default to FoundationStereo's own sample pair at `--scale 0.25`.
+
+#[cfg(any(feature = "cuda", feature = "riscv"))]
+fn is_aot_invocation(raw_args: &[String]) -> bool {
+    raw_args.iter().any(|a| a == "--device")
+}
+
+/// Traces one graph and hands it to the backend's ahead-of-time compiler.
+#[cfg(feature = "riscv")]
+fn aot_graph(
+    label: &str,
+    shapes: &[Vec<usize>],
+    options: &teeny_riscv::compiler::options::Options,
+    cache_dir: &str,
+    force: bool,
+    build: impl FnOnce(&[SymTensor]) -> Vec<(&'static str, SymTensor)>,
+) -> Result<()> {
+    let t = Instant::now();
+    let shape = |s: &[usize]| s.iter().map(|&d| Some(d)).collect::<Vec<_>>();
+    let (first, graph) = SymTensor::input(DtypeRepr::F32, shape(&shapes[0]));
+    let mut syms = vec![first.clone()];
+    for s in &shapes[1..] {
+        syms.push(input_like(&first, shape(s)));
+    }
+    let _ = build(&syms);
+    // Lower exactly what `Graph::new` lowers at run time: no optimizer pass. teeny-cli's
+    // `aot_compile` runs `Anduin` first, but this example compiles the graph as traced,
+    // and a kernel compiled from a different graph is a different cache key.
+    teeny_riscv::compiler::aot::compile_graph(
+        &graph.borrow(),
+        &TritonLowering::new(),
+        LoweringMode::Inference,
+        options,
+        cache_dir,
+        force,
+    )
+    .with_context(|| format!("AOT compiling {label}"))?;
+    println!(
+        "{label}: kernels compiled ({:.1} s)",
+        t.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "riscv")]
+fn run_aot(raw_args: &[String]) -> Result<()> {
+    #[derive(Parser)]
+    struct AotCli {
+        #[command(flatten)]
+        aot: teeny_cli::AotArgs,
+        /// Unpadded image height the board will run (before `padding`).
+        #[arg(long, default_value_t = 135)]
+        aot_height: usize,
+        /// Unpadded image width the board will run.
+        #[arg(long, default_value_t = 240)]
+        aot_width: usize,
+    }
+
+    let cli = AotCli::parse_from(raw_args);
+    ensure!(
+        cli.aot.device == "riscv",
+        "this example only AOT-compiles for --device riscv (got {})",
+        cli.aot.device
+    );
+
+    let (h, w) = (cli.aot_height, cli.aot_width);
+    let pads = padding(h, w);
+    let (hp, wp) = (h + pads[0] + pads[1], w + pads[2] + pads[3]);
+    println!("AOT for {w}x{h}, padded to {wp}x{hp}");
+
+    let options =
+        teeny_riscv::compiler::options::Options::parse(cli.aot.options.as_deref().unwrap_or(""))?;
+    let cache_dir = cli.aot.resolve_cache_dir();
+    std::fs::create_dir_all(&cache_dir)?;
+    let cache = cache_dir.to_string_lossy().to_string();
+    let force = cli.aot.force;
+
+    // The three graphs main() compiles, at the same shapes and in the same order.
+    let img = vec![1, 3, hp, wp];
+    aot_graph(
+        "prelude",
+        &[img.clone(), img],
+        &options,
+        &cache,
+        force,
+        |i| prelude::<f32>(&i[0], &i[1], (hp, wp)),
+    )?;
+
+    let dims = UpdateBlockDims::foundation_stereo();
+    let shape = StepShape {
+        batch: 1,
+        h: hp / 4,
+        w: wp / 4,
+        groups: VOLUME_DIM,
+        disps: DISPS,
+        w2: wp / 4,
+        levels: CORR_LEVELS,
+    };
+    let step_shapes: Vec<Vec<usize>> = step_inputs(&dims, &shape)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    aot_graph("step", &step_shapes, &options, &cache, force, |i| {
+        let _g = name_scope("update_block");
+        build_step::<f32>(dims, CORR_RADIUS, CORR_LEVELS, i)
+    })?;
+
+    let c = dims.mask_out;
+    aot_graph(
+        "upsample",
+        &[
+            vec![1, 1, hp / 4, wp / 4],
+            vec![1, c, hp / 4, wp / 4],
+            vec![1, c, hp / 2, wp / 2],
+        ],
+        &options,
+        &cache,
+        force,
+        |i| vec![("", upsample_disp::<f32>(c)(&i[0], &i[1], &i[2]))],
+    )?;
+
+    println!("AOT compile complete (device=riscv, cache={cache})");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     dotenv::dotenv().ok();
+
+    let raw_args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "riscv")]
+    if is_aot_invocation(&raw_args) {
+        return run_aot(&raw_args);
+    }
+    #[cfg(not(feature = "riscv"))]
+    if raw_args.iter().any(|a| a == "--device") {
+        anyhow::bail!("--device (AOT compile) requires the 'riscv' feature");
+    }
+
     let args = Args::parse();
     let (left, h, w) = load(&args.left, args.scale)?;
     let (right, hr, wr) = load(&args.right, args.scale)?;
